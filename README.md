@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="KNLF.logo" alt="KNLF Logo" width="400">
-</p>
-
 
 
 # KNLF Image Format
