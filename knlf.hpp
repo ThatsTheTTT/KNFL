@@ -1,18 +1,19 @@
+#ifndef KNLF_HPP
+#define KNLF_HPP
+
 #include <iostream>
 #include <vector>
 #include <cstdint>
-#include <cstring>
 #include <cmath>
-#include <fstream>
-#include <chrono>
+#include <algorithm>
 
 #pragma pack(push, 1)
 struct KNLFHeader {
-    char magic[4];
+    char magic[4];       // "KNLF"
     uint16_t width;
     uint16_t height;
     uint8_t channels;
-    uint8_t flags;
+    uint8_t flags;       // 1 = Stream Mode
 };
 #pragma pack(pop)
 
@@ -24,30 +25,15 @@ enum PredictorType : uint8_t {
     PRED_PAETH = 4
 };
 
-inline uint8_t paethPredictor(uint8_t a, uint8_t b, uint8_t c) {
-    int p = (int)a + (int)b - (int)c;
-    int pa = std::abs(p - (int)a);
-    int pb = std::abs(p - (int)b);
-    int pc = std::abs(p - (int)c);
-
-    if (pa <= pb && pa <= pc) return a;
-    if (pb <= pc) return b;
-    return c;
-}
-
-inline uint8_t encodeZigZag(int8_t val) {
-    return static_cast<uint8_t>((val << 1) ^ (val >> 7));
-}
-
-inline int8_t decodeZigZag(uint8_t val) {
-    return static_cast<int8_t>((val >> 1) ^ (-(val & 1)));
-}
-
-class BitWriter {
-public:
-    std::vector<uint8_t> buffer;
+// --- Побитовый вывод в поток ---
+class StreamBitWriter {
+private:
+    std::ostream& out;
     uint8_t currentByte = 0;
     uint8_t bitPos = 0;
+
+public:
+    StreamBitWriter(std::ostream& os) : out(os) {}
 
     void writeBits(uint32_t val, uint8_t numBits) {
         for (int i = numBits - 1; i >= 0; --i) {
@@ -55,7 +41,7 @@ public:
             currentByte |= (bit << (7 - bitPos));
             bitPos++;
             if (bitPos == 8) {
-                buffer.push_back(currentByte);
+                out.put(static_cast<char>(currentByte));
                 currentByte = 0;
                 bitPos = 0;
             }
@@ -64,31 +50,32 @@ public:
 
     void flush() {
         if (bitPos > 0) {
-            buffer.push_back(currentByte);
+            out.put(static_cast<char>(currentByte));
             currentByte = 0;
             bitPos = 0;
         }
     }
 };
 
-class BitReader {
+// --- Побитовое чтение из потока с защитой от EOF ---
+class StreamBitReader {
 private:
-    const uint8_t* data;
-    size_t size;
-    size_t bytePos = 0;
-    uint8_t bitPos = 0;
+    std::istream& in;
+    uint8_t currentByte = 0;
+    uint8_t bitPos = 8; // Принудительное чтение первого байта
 
 public:
-    BitReader(const uint8_t* src, size_t srcSize) : data(src), size(srcSize) {}
+    StreamBitReader(std::istream& is) : in(is) {}
 
     bool readBit(uint8_t& outBit) {
-        if (bytePos >= size) return false;
-        outBit = (data[bytePos] >> (7 - bitPos)) & 1;
-        bitPos++;
         if (bitPos == 8) {
+            int c = in.get();
+            if (c == EOF) return false;
+            currentByte = static_cast<uint8_t>(c);
             bitPos = 0;
-            bytePos++;
         }
+        outBit = (currentByte >> (7 - bitPos)) & 1;
+        bitPos++;
         return true;
     }
 
@@ -101,13 +88,21 @@ public:
         }
         return true;
     }
-
-    size_t getBytesRead() const { return bytePos + (bitPos > 0 ? 1 : 0); }
 };
 
-class KNLFEncoder {
+class KNLFStream {
 private:
-    static uint8_t getPredictorValue(PredictorType type, uint8_t left, uint8_t up, uint8_t upLeft) {
+    static uint8_t paethPredictor(uint8_t a, uint8_t b, uint8_t c) {
+        int p = (int)a + (int)b - (int)c;
+        int pa = std::abs(p - (int)a);
+        int pb = std::abs(p - (int)b);
+        int pc = std::abs(p - (int)c);
+        if (pa <= pb && pa <= pc) return a;
+        if (pb <= pc) return b;
+        return c;
+    }
+
+    static uint8_t getPredictor(PredictorType type, uint8_t left, uint8_t up, uint8_t upLeft) {
         switch (type) {
             case PRED_SUB:     return left;
             case PRED_UP:      return up;
@@ -117,257 +112,208 @@ private:
         }
     }
 
-    static uint64_t evaluateLineCost(PredictorType type, const uint8_t* currRow, 
-                                     const uint8_t* prevRow, uint16_t width, uint8_t channels) {
-        uint64_t cost = 0;
-        size_t rowSize = width * channels;
+    static uint8_t encodeZigZag(int8_t val) {
+        return static_cast<uint8_t>((val << 1) ^ (val >> 7));
+    }
 
-        for (size_t i = 0; i < rowSize; ++i) {
-            uint8_t left = (i >= channels) ? currRow[i - channels] : 0;
-            uint8_t up = prevRow ? prevRow[i] : 0;
-            uint8_t upLeft = (prevRow && i >= channels) ? prevRow[i - channels] : 0;
-
-            uint8_t pred = getPredictorValue(type, left, up, upLeft);
-            int8_t diff = static_cast<int8_t>(currRow[i] - pred);
-            cost += std::abs(diff);
-        }
-        return cost;
+    static int8_t decodeZigZag(uint8_t val) {
+        return static_cast<int8_t>((val >> 1) ^ (-(val & 1)));
     }
 
 public:
-    static bool compress(const uint8_t* rawPixels, uint16_t width, uint16_t height, 
-                         uint8_t channels, std::vector<uint8_t>& outBuffer) {
-        if (!rawPixels || width == 0 || height == 0 || (channels != 3 && channels != 4)) {
-            return false;
+    // --- 1. Потоковый Энкодер ---
+    class Encoder {
+    private:
+        std::ostream& out;
+        uint16_t width, height;
+        uint8_t channels;
+        std::vector<uint8_t> prevRow;
+
+    public:
+        Encoder(std::ostream& outputStream, uint16_t w, uint16_t h, uint8_t ch)
+            : out(outputStream), width(w), height(h), channels(ch) {
+            
+            KNLFHeader header = {{'K', 'N', 'L', 'F'}, width, height, channels, 1};
+            out.write(reinterpret_cast<const char*>(&header), sizeof(header));
+            prevRow.resize(width * channels, 0);
         }
 
-        KNLFHeader header;
-        header.magic[0] = 'K'; header.magic[1] = 'N'; 
-        header.magic[2] = 'L'; header.magic[3] = 'F';
-        header.width = width;
-        header.height = height;
-        header.channels = channels;
-        header.flags = 0;
-
-        outBuffer.clear();
-        uint8_t* headerPtr = reinterpret_cast<uint8_t*>(&header);
-        outBuffer.insert(outBuffer.end(), headerPtr, headerPtr + sizeof(KNLFHeader));
-
-        BitWriter bw;
-        size_t stride = width * channels;
-        std::vector<uint8_t> residualLine(stride);
-
-        for (uint16_t y = 0; y < height; ++y) {
-            const uint8_t* currRow = rawPixels + (y * stride);
-            const uint8_t* prevRow = (y > 0) ? (rawPixels + ((y - 1) * stride)) : nullptr;
-
+        bool encodeScanline(const uint8_t* currRow) {
+            size_t stride = width * channels;
+            
+            // Шаг 1: Выбор лучшего предиктора
             PredictorType bestPred = PRED_NONE;
-            uint64_t minCost = evaluateLineCost(PRED_NONE, currRow, prevRow, width, channels);
+            uint64_t minCost = 0xFFFFFFFFFFFFFFFFULL;
 
-            for (int p = 1; p <= 4; ++p) {
+            for (int p = 0; p <= 4; ++p) {
                 PredictorType testPred = static_cast<PredictorType>(p);
-                uint64_t cost = evaluateLineCost(testPred, currRow, prevRow, width, channels);
+                uint64_t cost = 0;
+                for (size_t i = 0; i < stride; ++i) {
+                    uint8_t left = (i >= channels) ? currRow[i - channels] : 0;
+                    uint8_t up = prevRow[i];
+                    uint8_t upLeft = (i >= channels) ? prevRow[i - channels] : 0;
+                    uint8_t pred = getPredictor(testPred, left, up, upLeft);
+                    cost += std::abs(static_cast<int8_t>(currRow[i] - pred));
+                }
                 if (cost < minCost) {
                     minCost = cost;
                     bestPred = testPred;
                 }
             }
 
-            bw.writeBits(static_cast<uint32_t>(bestPred), 3);
-
+            // Шаг 2: Вычисление массива разностей (residuals)
+            std::vector<uint8_t> residualLine(stride);
             for (size_t i = 0; i < stride; ++i) {
                 uint8_t left = (i >= channels) ? currRow[i - channels] : 0;
-                uint8_t up = prevRow ? prevRow[i] : 0;
-                uint8_t upLeft = (prevRow && i >= channels) ? prevRow[i - channels] : 0;
-
-                uint8_t pred = getPredictorValue(bestPred, left, up, upLeft);
-                int8_t diff = static_cast<int8_t>(currRow[i] - pred);
-                residualLine[i] = encodeZigZag(diff);
+                uint8_t up = prevRow[i];
+                uint8_t upLeft = (i >= channels) ? prevRow[i - channels] : 0;
+                uint8_t pred = getPredictor(bestPred, left, up, upLeft);
+                residualLine[i] = encodeZigZag(static_cast<int8_t>(currRow[i] - pred));
             }
+
+            // Шаг 3: Побитовая упаковка (BitStream)
+            StreamBitWriter bw(out);
+            bw.writeBits(static_cast<uint32_t>(bestPred), 3);
 
             size_t idx = 0;
             while (idx < stride) {
                 if (residualLine[idx] == 0) {
+                    // Zero RLE (до 64 нулей)
                     size_t zeroRun = 0;
-                    while (idx + zeroRun < stride && residualLine[idx + zeroRun] == 0 && zeroRun < 63) {
+                    while (idx + zeroRun < stride && residualLine[idx + zeroRun] == 0 && zeroRun < 64) {
                         zeroRun++;
                     }
-                    bw.writeBits(0, 2); 
-                    bw.writeBits(static_cast<uint32_t>(zeroRun), 6);
+                    bw.writeBits(0, 2); // Mode 00
+                    bw.writeBits(static_cast<uint32_t>(zeroRun - 1), 6);
                     idx += zeroRun;
                 } else {
-                    uint8_t val = residualLine[idx];
-                    if (val <= 15) {
-                        bw.writeBits(1, 2);
-                        bw.writeBits(val, 4);
-                    } else {
-                        bw.writeBits(2, 2);
-                        bw.writeBits(val, 8);
+                    // Поиск повторов для ненулевых дельт
+                    size_t run = 0;
+                    while (idx + run < stride && residualLine[idx + run] == residualLine[idx] && run < 66) {
+                        run++;
                     }
-                    idx++;
+
+                    if (run >= 3) {
+                        // Repeat RLE (Mode 11)
+                        bw.writeBits(3, 2);
+                        bw.writeBits(static_cast<uint32_t>(run - 3), 6);
+                        bw.writeBits(residualLine[idx], 8);
+                        idx += run;
+                    } else if (residualLine[idx] <= 15) {
+                        // Small Delta (Mode 01)
+                        bw.writeBits(1, 2);
+                        bw.writeBits(residualLine[idx], 4);
+                        idx++;
+                    } else {
+                        // Full Delta (Mode 10)
+                        bw.writeBits(2, 2);
+                        bw.writeBits(residualLine[idx], 8);
+                        idx++;
+                    }
+                }
+            }
+
+            bw.flush(); // Выравнивание по байту для текущей строки
+            std::copy(currRow, currRow + stride, prevRow.begin());
+            return out.good();
+        }
+    };
+
+    // --- 2. Потоковый Декодер ---
+    class Decoder {
+    private:
+        std::istream& in;
+        KNLFHeader header;
+        std::vector<uint8_t> prevRow;
+        bool validHeader = false;
+
+    public:
+        Decoder(std::istream& inputStream) : in(inputStream) {
+            if (in.read(reinterpret_cast<char*>(&header), sizeof(header))) {
+                if (header.magic[0] == 'K' && header.magic[1] == 'N' && 
+                    header.magic[2] == 'L' && header.magic[3] == 'F') {
+                    validHeader = true;
+                    prevRow.resize(header.width * header.channels, 0);
                 }
             }
         }
 
-        bw.flush();
-        outBuffer.insert(outBuffer.end(), bw.buffer.begin(), bw.buffer.end());
-        return true;
-    }
-};
+        bool isValid() const { return validHeader; }
+        const KNLFHeader& getHeader() const { return header; }
 
-class KNLFDecoder {
-private:
-    static uint8_t getPredictorValue(PredictorType type, uint8_t left, uint8_t up, uint8_t upLeft) {
-        switch (type) {
-            case PRED_SUB:     return left;
-            case PRED_UP:      return up;
-            case PRED_AVERAGE: return (static_cast<uint16_t>(left) + up) / 2;
-            case PRED_PAETH:   return paethPredictor(left, up, upLeft);
-            default:           return 0;
-        }
-    }
+        bool decodeScanline(uint8_t* outRow) {
+            if (!validHeader) return false;
 
-public:
-    static bool decompress(const uint8_t* compressedData, size_t compressedSize,
-                           std::vector<uint8_t>& outPixels, uint16_t& outWidth, 
-                           uint16_t& outHeight, uint8_t& outChannels) {
-        if (!compressedData || compressedSize < sizeof(KNLFHeader)) {
-            return false;
-        }
+            size_t stride = header.width * header.channels;
+            StreamBitReader br(in);
 
-        const KNLFHeader* header = reinterpret_cast<const KNLFHeader*>(compressedData);
-        if (header->magic[0] != 'K' || header->magic[1] != 'N' ||
-            header->magic[2] != 'L' || header->magic[3] != 'F') {
-            return false;
-        }
-
-        outWidth = header->width;
-        outHeight = header->height;
-        outChannels = header->channels;
-
-        size_t stride = outWidth * outChannels;
-        outPixels.resize(stride * outHeight);
-
-        BitReader br(compressedData + sizeof(KNLFHeader), compressedSize - sizeof(KNLFHeader));
-
-        for (uint16_t y = 0; y < outHeight; ++y) {
             uint32_t predBits = 0;
-            if (!br.readBits(predBits, 3)) return false;
+            if (!br.readBits(predBits, 3)) return false; // Защита от EOF
             PredictorType predType = static_cast<PredictorType>(predBits);
-
-            uint8_t* currRow = outPixels.data() + (y * stride);
-            const uint8_t* prevRow = (y > 0) ? (outPixels.data() + ((y - 1) * stride)) : nullptr;
 
             size_t idx = 0;
             while (idx < stride) {
                 uint32_t mode = 0;
-                if (!br.readBits(mode, 2)) return false;
+                if (!br.readBits(mode, 2)) return false; // Защита от EOF
 
-                if (mode == 0) {
-                    uint32_t runLen = 0;
-                    if (!br.readBits(runLen, 6)) return false;
-                    for (size_t r = 0; r < runLen && idx < stride; ++r) {
-                        uint8_t left = (idx >= outChannels) ? currRow[idx - outChannels] : 0;
-                        uint8_t up = prevRow ? prevRow[idx] : 0;
-                        uint8_t upLeft = (prevRow && idx >= outChannels) ? prevRow[idx - outChannels] : 0;
+                if (mode == 0) { // Zero RLE
+                    uint32_t runVal = 0;
+                    if (!br.readBits(runVal, 6)) return false;
+                    size_t run = runVal + 1;
 
-                        uint8_t pred = getPredictorValue(predType, left, up, upLeft);
-                        currRow[idx] = pred;
+                    for (size_t r = 0; r < run && idx < stride; ++r) {
+                        uint8_t left = (idx >= header.channels) ? outRow[idx - header.channels] : 0;
+                        uint8_t up = prevRow[idx];
+                        uint8_t upLeft = (idx >= header.channels) ? prevRow[idx - header.channels] : 0;
+                        uint8_t pred = getPredictor(predType, left, up, upLeft);
+                        outRow[idx] = pred; // diff == 0
                         idx++;
                     }
-                } else if (mode == 1) {
+                } else if (mode == 1) { // Small Delta
                     uint32_t val = 0;
                     if (!br.readBits(val, 4)) return false;
                     int8_t diff = decodeZigZag(static_cast<uint8_t>(val));
 
-                    uint8_t left = (idx >= outChannels) ? currRow[idx - outChannels] : 0;
-                    uint8_t up = prevRow ? prevRow[idx] : 0;
-                    uint8_t upLeft = (prevRow && idx >= outChannels) ? prevRow[idx - outChannels] : 0;
-
-                    uint8_t pred = getPredictorValue(predType, left, up, upLeft);
-                    currRow[idx] = static_cast<uint8_t>(pred + diff);
+                    uint8_t left = (idx >= header.channels) ? outRow[idx - header.channels] : 0;
+                    uint8_t up = prevRow[idx];
+                    uint8_t upLeft = (idx >= header.channels) ? prevRow[idx - header.channels] : 0;
+                    uint8_t pred = getPredictor(predType, left, up, upLeft);
+                    outRow[idx] = static_cast<uint8_t>(pred + diff);
                     idx++;
-                } else if (mode == 2) {
+                } else if (mode == 2) { // Full Delta
                     uint32_t val = 0;
                     if (!br.readBits(val, 8)) return false;
                     int8_t diff = decodeZigZag(static_cast<uint8_t>(val));
 
-                    uint8_t left = (idx >= outChannels) ? currRow[idx - outChannels] : 0;
-                    uint8_t up = prevRow ? prevRow[idx] : 0;
-                    uint8_t upLeft = (prevRow && idx >= outChannels) ? prevRow[idx - outChannels] : 0;
-
-                    uint8_t pred = getPredictorValue(predType, left, up, upLeft);
-                    currRow[idx] = static_cast<uint8_t>(pred + diff);
+                    uint8_t left = (idx >= header.channels) ? outRow[idx - header.channels] : 0;
+                    uint8_t up = prevRow[idx];
+                    uint8_t upLeft = (idx >= header.channels) ? prevRow[idx - header.channels] : 0;
+                    uint8_t pred = getPredictor(predType, left, up, upLeft);
+                    outRow[idx] = static_cast<uint8_t>(pred + diff);
                     idx++;
+                } else if (mode == 3) { // Repeat RLE
+                    uint32_t runVal = 0, val = 0;
+                    if (!br.readBits(runVal, 6)) return false;
+                    if (!br.readBits(val, 8)) return false;
+                    
+                    size_t run = runVal + 3;
+                    int8_t diff = decodeZigZag(static_cast<uint8_t>(val));
+
+                    for (size_t r = 0; r < run && idx < stride; ++r) {
+                        uint8_t left = (idx >= header.channels) ? outRow[idx - header.channels] : 0;
+                        uint8_t up = prevRow[idx];
+                        uint8_t upLeft = (idx >= header.channels) ? prevRow[idx - header.channels] : 0;
+                        uint8_t pred = getPredictor(predType, left, up, upLeft);
+                        outRow[idx] = static_cast<uint8_t>(pred + diff);
+                        idx++;
+                    }
                 }
             }
+
+            std::copy(outRow, outRow + stride, prevRow.begin());
+            return true;
         }
-        return true;
-    }
+    };
 };
 
-std::vector<uint8_t> generateTestPattern(uint16_t w, uint16_t h, uint8_t channels) {
-    std::vector<uint8_t> img(w * h * channels);
-    for (uint16_t y = 0; y < h; ++y) {
-        for (uint16_t x = 0; x < w; ++x) {
-            size_t idx = (y * w + x) * channels;
-            img[idx + 0] = static_cast<uint8_t>((x * 255) / w);
-            img[idx + 1] = static_cast<uint8_t>((y * 255) / h);
-            img[idx + 2] = static_cast<uint8_t>(((x + y) * 128) / (w + h));
-            if (channels == 4) {
-                img[idx + 3] = 255;
-            }
-        }
-    }
-    return img;
-}
-
-int main() {
-    const uint16_t WIDTH = 512;
-    const uint16_t HEIGHT = 512;
-    const uint8_t CHANNELS = 3;
-
-    std::vector<uint8_t> originalPixels = generateTestPattern(WIDTH, HEIGHT, CHANNELS);
-
-    std::vector<uint8_t> compressedKNLF;
-    bool encSuccess = KNLFEncoder::compress(originalPixels.data(), WIDTH, HEIGHT, CHANNELS, compressedKNLF);
-
-    if (!encSuccess) {
-        return 1;
-    }
-
-    const char* filename = "output.knlf";
-    {
-        std::ofstream outFile(filename, std::ios::binary);
-        outFile.write(reinterpret_cast<const char*>(compressedKNLF.data()), compressedKNLF.size());
-    }
-
-    std::vector<uint8_t> loadedKNLF;
-    {
-        std::ifstream inFile(filename, std::ios::binary | std::ios::ate);
-        std::streamsize fsize = inFile.tellg();
-        inFile.seekg(0, std::ios::beg);
-        loadedKNLF.resize(fsize);
-        inFile.read(reinterpret_cast<char*>(loadedKNLF.data()), fsize);
-    }
-
-    std::vector<uint8_t> decompressedPixels;
-    uint16_t decW = 0, decH = 0;
-    uint8_t decChannels = 0;
-
-    bool decSuccess = KNLFDecoder::decompress(loadedKNLF.data(), loadedKNLF.size(), 
-                                               decompressedPixels, decW, decH, decChannels);
-
-    if (!decSuccess) {
-        return 1;
-    }
-
-    bool isExactMatch = (originalPixels == decompressedPixels);
-
-    if (isExactMatch) {
-        return 0;
-    } else {
-        return 2;
-    }
-}
-
+#endif // KNLF_HPP
