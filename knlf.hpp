@@ -25,7 +25,6 @@ enum PredictorType : uint8_t {
     PRED_PAETH = 4
 };
 
-// --- Побитовый вывод в поток с контролем выравнивания ---
 class StreamBitWriter {
 private:
     std::ostream& out;
@@ -48,7 +47,6 @@ public:
         }
     }
 
-    // Выравнивание потока по границе байта
     void flush() {
         if (bitPos > 0) {
             out.put(static_cast<char>(currentByte));
@@ -58,17 +56,15 @@ public:
     }
 };
 
-// --- Побитовое чтение из потока с защитой от EOF и выравниванием ---
 class StreamBitReader {
 private:
     std::istream& in;
     uint8_t currentByte = 0;
-    uint8_t bitPos = 8; // Принудительное чтение первого байта
+    uint8_t bitPos = 8;
 
 public:
     StreamBitReader(std::istream& is) : in(is) {}
 
-    // Сброс неполного байта для выравнивания перед следующей строкой
     void align() {
         bitPos = 8;
     }
@@ -118,20 +114,17 @@ private:
         }
     }
 
-    // Безопасное ZigZag кодирование без UB
     static uint8_t encodeZigZag(int8_t val) {
         return (val >= 0) ? static_cast<uint8_t>(val << 1)
                           : static_cast<uint8_t>((-static_cast<int>(val) << 1) - 1);
     }
 
-    // Безопасное ZigZag декодирование
     static int8_t decodeZigZag(uint8_t val) {
         return (val & 1) ? static_cast<int8_t>(-(static_cast<int>(val >> 1) + 1))
                          : static_cast<int8_t>(val >> 1);
     }
 
 public:
-    // --- 1. Потоковый Энкодер ---
     class Encoder {
     private:
         std::ostream& out;
@@ -152,7 +145,6 @@ public:
         bool encodeScanline(const uint8_t* currRow) {
             size_t stride = width * channels;
             
-            // Шаг 1: Корректный расчёт стоимости предиктора (без переполнений)
             PredictorType bestPred = PRED_NONE;
             uint64_t minCost = 0xFFFFFFFFFFFFFFFFULL;
 
@@ -174,7 +166,6 @@ public:
                 }
             }
 
-            // Шаг 2: Вычисление массива разностей (residuals)
             std::vector<uint8_t> residualLine(stride);
             for (size_t i = 0; i < stride; ++i) {
                 uint8_t left = (i >= channels) ? currRow[i - channels] : 0;
@@ -186,40 +177,34 @@ public:
                 residualLine[i] = encodeZigZag(diff);
             }
 
-            // Шаг 3: Побитовая упаковка (BitStream)
             bw.writeBits(static_cast<uint32_t>(bestPred), 3);
 
             size_t idx = 0;
             while (idx < stride) {
                 if (residualLine[idx] == 0) {
-                    // Zero RLE (до 64 нулей)
                     size_t zeroRun = 0;
                     while (idx + zeroRun < stride && residualLine[idx + zeroRun] == 0 && zeroRun < 64) {
                         zeroRun++;
                     }
-                    bw.writeBits(0, 2); // Mode 00
+                    bw.writeBits(0, 2);
                     bw.writeBits(static_cast<uint32_t>(zeroRun - 1), 6);
                     idx += zeroRun;
                 } else {
-                    // Поиск повторов для ненулевых дельт
                     size_t run = 0;
                     while (idx + run < stride && residualLine[idx + run] == residualLine[idx] && run < 66) {
                         run++;
                     }
 
                     if (run >= 3) {
-                        // Repeat RLE (Mode 11)
                         bw.writeBits(3, 2);
                         bw.writeBits(static_cast<uint32_t>(run - 3), 6);
                         bw.writeBits(residualLine[idx], 8);
                         idx += run;
                     } else if (residualLine[idx] <= 15) {
-                        // Small Delta (Mode 01)
                         bw.writeBits(1, 2);
                         bw.writeBits(residualLine[idx], 4);
                         idx++;
                     } else {
-                        // Full Delta (Mode 10)
                         bw.writeBits(2, 2);
                         bw.writeBits(residualLine[idx], 8);
                         idx++;
@@ -227,14 +212,12 @@ public:
                 }
             }
 
-            // Гарантированное выравнивание потока до границы байта в конце строки
             bw.flush(); 
             std::copy(currRow, currRow + stride, prevRow.begin());
             return out.good();
         }
     };
 
-    // --- 2. Потоковый Декодер ---
     class Decoder {
     private:
         std::istream& in;
@@ -263,15 +246,15 @@ public:
             size_t stride = header.width * header.channels;
 
             uint32_t predBits = 0;
-            if (!br.readBits(predBits, 3)) return false; // Защита от EOF
+            if (!br.readBits(predBits, 3)) return false;
             PredictorType predType = static_cast<PredictorType>(predBits);
 
             size_t idx = 0;
             while (idx < stride) {
                 uint32_t mode = 0;
-                if (!br.readBits(mode, 2)) return false; // Защита от EOF
+                if (!br.readBits(mode, 2)) return false;
 
-                if (mode == 0) { // Zero RLE
+                if (mode == 0) {
                     uint32_t runVal = 0;
                     if (!br.readBits(runVal, 6)) return false;
                     size_t run = runVal + 1;
@@ -281,10 +264,10 @@ public:
                         uint8_t up = prevRow[idx];
                         uint8_t upLeft = (idx >= header.channels) ? prevRow[idx - header.channels] : 0;
                         uint8_t pred = getPredictor(predType, left, up, upLeft);
-                        outRow[idx] = pred; // diff == 0
+                        outRow[idx] = pred;
                         idx++;
                     }
-                } else if (mode == 1) { // Small Delta
+                } else if (mode == 1) {
                     uint32_t val = 0;
                     if (!br.readBits(val, 4)) return false;
                     int8_t diff = decodeZigZag(static_cast<uint8_t>(val));
@@ -295,7 +278,7 @@ public:
                     uint8_t pred = getPredictor(predType, left, up, upLeft);
                     outRow[idx] = static_cast<uint8_t>(pred + diff);
                     idx++;
-                } else if (mode == 2) { // Full Delta
+                } else if (mode == 2) {
                     uint32_t val = 0;
                     if (!br.readBits(val, 8)) return false;
                     int8_t diff = decodeZigZag(static_cast<uint8_t>(val));
@@ -306,7 +289,7 @@ public:
                     uint8_t pred = getPredictor(predType, left, up, upLeft);
                     outRow[idx] = static_cast<uint8_t>(pred + diff);
                     idx++;
-                } else if (mode == 3) { // Repeat RLE
+                } else if (mode == 3) {
                     uint32_t runVal = 0, val = 0;
                     if (!br.readBits(runVal, 6)) return false;
                     if (!br.readBits(val, 8)) return false;
@@ -325,7 +308,6 @@ public:
                 }
             }
 
-            // Выравнивание читателя перед следующей строкой
             br.align(); 
             std::copy(outRow, outRow + stride, prevRow.begin());
             return true;
