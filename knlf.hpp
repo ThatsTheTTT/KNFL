@@ -152,6 +152,14 @@ public:
             prevRow.resize(width * channels, 0);
         }
 
+        ~Encoder() {
+            flush();
+        }
+
+        void flush() {
+            bw.align();
+        }
+
         bool encodeScanline(const uint8_t* currRow) {
             size_t stride = width * channels;
             
@@ -211,7 +219,6 @@ public:
                 }
             }
 
-            bw.align(); 
             std::copy(currRow, currRow + stride, prevRow.begin());
             return out.good();
         }
@@ -303,7 +310,6 @@ public:
                 }
             }
 
-            br.align(); 
             std::copy(outRow, outRow + stride, prevRow.begin());
             return true;
         }
