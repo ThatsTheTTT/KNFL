@@ -9,11 +9,11 @@
 
 #pragma pack(push, 1)
 struct KNLFHeader {
-    char magic[4];       // "KNLF"
+    char magic[4];
     uint16_t width;
     uint16_t height;
     uint8_t channels;
-    uint8_t flags;       // 1 = Stream Mode
+    uint8_t flags;
 };
 #pragma pack(pop)
 
@@ -47,7 +47,7 @@ public:
         }
     }
 
-    void flush() {
+    void align() {
         if (bitPos > 0) {
             out.put(static_cast<char>(currentByte));
             currentByte = 0;
@@ -66,7 +66,9 @@ public:
     StreamBitReader(std::istream& is) : in(is) {}
 
     void align() {
-        bitPos = 8;
+        if (bitPos < 8) {
+            bitPos = 8;
+        }
     }
 
     bool readBit(uint8_t& outBit) {
@@ -137,8 +139,16 @@ public:
         Encoder(std::ostream& outputStream, uint16_t w, uint16_t h, uint8_t ch)
             : out(outputStream), bw(outputStream), width(w), height(h), channels(ch) {
             
-            KNLFHeader header = {{'K', 'N', 'L', 'F'}, width, height, channels, 1};
-            out.write(reinterpret_cast<const char*>(&header), sizeof(header));
+            out.write("KNLF", 4);
+            uint8_t headerData[6];
+            headerData[0] = static_cast<uint8_t>(width & 0xFF);
+            headerData[1] = static_cast<uint8_t>(width >> 8);
+            headerData[2] = static_cast<uint8_t>(height & 0xFF);
+            headerData[3] = static_cast<uint8_t>(height >> 8);
+            headerData[4] = channels;
+            headerData[5] = 1;
+            out.write(reinterpret_cast<char*>(headerData), 6);
+            
             prevRow.resize(width * channels, 0);
         }
 
@@ -190,29 +200,18 @@ public:
                     bw.writeBits(static_cast<uint32_t>(zeroRun - 1), 6);
                     idx += zeroRun;
                 } else {
-                    size_t run = 0;
-                    while (idx + run < stride && residualLine[idx + run] == residualLine[idx] && run < 66) {
-                        run++;
-                    }
-
-                    if (run >= 3) {
-                        bw.writeBits(3, 2);
-                        bw.writeBits(static_cast<uint32_t>(run - 3), 6);
-                        bw.writeBits(residualLine[idx], 8);
-                        idx += run;
-                    } else if (residualLine[idx] <= 15) {
+                    if (residualLine[idx] <= 15) {
                         bw.writeBits(1, 2);
                         bw.writeBits(residualLine[idx], 4);
-                        idx++;
                     } else {
                         bw.writeBits(2, 2);
                         bw.writeBits(residualLine[idx], 8);
-                        idx++;
                     }
+                    idx++;
                 }
             }
 
-            bw.flush(); 
+            bw.align(); 
             std::copy(currRow, currRow + stride, prevRow.begin());
             return out.good();
         }
@@ -228,9 +227,18 @@ public:
 
     public:
         Decoder(std::istream& inputStream) : in(inputStream), br(inputStream) {
-            if (in.read(reinterpret_cast<char*>(&header), sizeof(header))) {
-                if (header.magic[0] == 'K' && header.magic[1] == 'N' && 
-                    header.magic[2] == 'L' && header.magic[3] == 'F') {
+            char magic[4];
+            if (in.read(magic, 4) && magic[0] == 'K' && magic[1] == 'N' && magic[2] == 'L' && magic[3] == 'F') {
+                uint8_t headerData[6];
+                if (in.read(reinterpret_cast<char*>(headerData), 6)) {
+                    header.magic[0] = 'K'; 
+                    header.magic[1] = 'N'; 
+                    header.magic[2] = 'L'; 
+                    header.magic[3] = 'F';
+                    header.width = headerData[0] | (headerData[1] << 8);
+                    header.height = headerData[2] | (headerData[3] << 8);
+                    header.channels = headerData[4];
+                    header.flags = headerData[5];
                     validHeader = true;
                     prevRow.resize(header.width * header.channels, 0);
                 }
@@ -258,8 +266,9 @@ public:
                     uint32_t runVal = 0;
                     if (!br.readBits(runVal, 6)) return false;
                     size_t run = runVal + 1;
+                    if (idx + run > stride) return false;
 
-                    for (size_t r = 0; r < run && idx < stride; ++r) {
+                    for (size_t r = 0; r < run; ++r) {
                         uint8_t left = (idx >= header.channels) ? outRow[idx - header.channels] : 0;
                         uint8_t up = prevRow[idx];
                         uint8_t upLeft = (idx >= header.channels) ? prevRow[idx - header.channels] : 0;
@@ -289,22 +298,8 @@ public:
                     uint8_t pred = getPredictor(predType, left, up, upLeft);
                     outRow[idx] = static_cast<uint8_t>(pred + diff);
                     idx++;
-                } else if (mode == 3) {
-                    uint32_t runVal = 0, val = 0;
-                    if (!br.readBits(runVal, 6)) return false;
-                    if (!br.readBits(val, 8)) return false;
-                    
-                    size_t run = runVal + 3;
-                    int8_t diff = decodeZigZag(static_cast<uint8_t>(val));
-
-                    for (size_t r = 0; r < run && idx < stride; ++r) {
-                        uint8_t left = (idx >= header.channels) ? outRow[idx - header.channels] : 0;
-                        uint8_t up = prevRow[idx];
-                        uint8_t upLeft = (idx >= header.channels) ? prevRow[idx - header.channels] : 0;
-                        uint8_t pred = getPredictor(predType, left, up, upLeft);
-                        outRow[idx] = static_cast<uint8_t>(pred + diff);
-                        idx++;
-                    }
+                } else {
+                    return false;
                 }
             }
 
@@ -315,4 +310,4 @@ public:
     };
 };
 
-#endif // KNLF_HPP
+#endif
