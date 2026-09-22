@@ -25,7 +25,7 @@ enum PredictorType : uint8_t {
     PRED_PAETH = 4
 };
 
-// --- Побитовый вывод в поток ---
+// --- Побитовый вывод в поток с контролем выравнивания ---
 class StreamBitWriter {
 private:
     std::ostream& out;
@@ -48,6 +48,7 @@ public:
         }
     }
 
+    // Выравнивание потока по границе байта
     void flush() {
         if (bitPos > 0) {
             out.put(static_cast<char>(currentByte));
@@ -57,7 +58,7 @@ public:
     }
 };
 
-// --- Побитовое чтение из потока с защитой от EOF ---
+// --- Побитовое чтение из потока с защитой от EOF и выравниванием ---
 class StreamBitReader {
 private:
     std::istream& in;
@@ -66,6 +67,11 @@ private:
 
 public:
     StreamBitReader(std::istream& is) : in(is) {}
+
+    // Сброс неполного байта для выравнивания перед следующей строкой
+    void align() {
+        bitPos = 8;
+    }
 
     bool readBit(uint8_t& outBit) {
         if (bitPos == 8) {
@@ -112,12 +118,16 @@ private:
         }
     }
 
+    // Безопасное ZigZag кодирование без UB
     static uint8_t encodeZigZag(int8_t val) {
-        return static_cast<uint8_t>((val << 1) ^ (val >> 7));
+        return (val >= 0) ? static_cast<uint8_t>(val << 1)
+                          : static_cast<uint8_t>((-static_cast<int>(val) << 1) - 1);
     }
 
+    // Безопасное ZigZag декодирование
     static int8_t decodeZigZag(uint8_t val) {
-        return static_cast<int8_t>((val >> 1) ^ (-(val & 1)));
+        return (val & 1) ? static_cast<int8_t>(-(static_cast<int>(val >> 1) + 1))
+                         : static_cast<int8_t>(val >> 1);
     }
 
 public:
@@ -125,13 +135,14 @@ public:
     class Encoder {
     private:
         std::ostream& out;
+        StreamBitWriter bw;
         uint16_t width, height;
         uint8_t channels;
         std::vector<uint8_t> prevRow;
 
     public:
         Encoder(std::ostream& outputStream, uint16_t w, uint16_t h, uint8_t ch)
-            : out(outputStream), width(w), height(h), channels(ch) {
+            : out(outputStream), bw(outputStream), width(w), height(h), channels(ch) {
             
             KNLFHeader header = {{'K', 'N', 'L', 'F'}, width, height, channels, 1};
             out.write(reinterpret_cast<const char*>(&header), sizeof(header));
@@ -141,7 +152,7 @@ public:
         bool encodeScanline(const uint8_t* currRow) {
             size_t stride = width * channels;
             
-            // Шаг 1: Выбор лучшего предиктора
+            // Шаг 1: Корректный расчёт стоимости предиктора (без переполнений)
             PredictorType bestPred = PRED_NONE;
             uint64_t minCost = 0xFFFFFFFFFFFFFFFFULL;
 
@@ -153,7 +164,9 @@ public:
                     uint8_t up = prevRow[i];
                     uint8_t upLeft = (i >= channels) ? prevRow[i - channels] : 0;
                     uint8_t pred = getPredictor(testPred, left, up, upLeft);
-                    cost += std::abs(static_cast<int8_t>(currRow[i] - pred));
+                    
+                    int8_t diff = static_cast<int8_t>(static_cast<uint8_t>(currRow[i] - pred));
+                    cost += std::abs(static_cast<int>(diff));
                 }
                 if (cost < minCost) {
                     minCost = cost;
@@ -168,11 +181,12 @@ public:
                 uint8_t up = prevRow[i];
                 uint8_t upLeft = (i >= channels) ? prevRow[i - channels] : 0;
                 uint8_t pred = getPredictor(bestPred, left, up, upLeft);
-                residualLine[i] = encodeZigZag(static_cast<int8_t>(currRow[i] - pred));
+                
+                int8_t diff = static_cast<int8_t>(static_cast<uint8_t>(currRow[i] - pred));
+                residualLine[i] = encodeZigZag(diff);
             }
 
             // Шаг 3: Побитовая упаковка (BitStream)
-            StreamBitWriter bw(out);
             bw.writeBits(static_cast<uint32_t>(bestPred), 3);
 
             size_t idx = 0;
@@ -213,7 +227,8 @@ public:
                 }
             }
 
-            bw.flush(); // Выравнивание по байту для текущей строки
+            // Гарантированное выравнивание потока до границы байта в конце строки
+            bw.flush(); 
             std::copy(currRow, currRow + stride, prevRow.begin());
             return out.good();
         }
@@ -223,12 +238,13 @@ public:
     class Decoder {
     private:
         std::istream& in;
+        StreamBitReader br;
         KNLFHeader header;
         std::vector<uint8_t> prevRow;
         bool validHeader = false;
 
     public:
-        Decoder(std::istream& inputStream) : in(inputStream) {
+        Decoder(std::istream& inputStream) : in(inputStream), br(inputStream) {
             if (in.read(reinterpret_cast<char*>(&header), sizeof(header))) {
                 if (header.magic[0] == 'K' && header.magic[1] == 'N' && 
                     header.magic[2] == 'L' && header.magic[3] == 'F') {
@@ -245,7 +261,6 @@ public:
             if (!validHeader) return false;
 
             size_t stride = header.width * header.channels;
-            StreamBitReader br(in);
 
             uint32_t predBits = 0;
             if (!br.readBits(predBits, 3)) return false; // Защита от EOF
@@ -310,6 +325,8 @@ public:
                 }
             }
 
+            // Выравнивание читателя перед следующей строкой
+            br.align(); 
             std::copy(outRow, outRow + stride, prevRow.begin());
             return true;
         }
