@@ -1,6 +1,8 @@
 #ifndef KNLF_HPP
 #define KNLF_HPP
 
+// Recommended file extension: .knlf
+
 #include <iostream>
 #include <vector>
 #include <cstdint>
@@ -16,7 +18,7 @@ struct KNLFHeader {
     uint16_t width;
     uint16_t height;
     uint8_t channels;
-    uint8_t flags;
+    uint8_t formatVersion;
 };
 #pragma pack(pop)
 
@@ -106,6 +108,9 @@ private:
     static constexpr size_t MAX_DECODE_STRIDE = 64 * 1024 * 1024;
     static constexpr uint8_t FORMAT_VERSION = 1;
     static constexpr size_t HEADER_BODY_SIZE = 6;
+    static constexpr uint32_t CRC32_POLY = 0xEDB88320u;
+    static constexpr uint32_t CRC32_INIT = 0xFFFFFFFFu;
+    static constexpr uint32_t CRC32_XOROUT = 0xFFFFFFFFu;
 
     static uint8_t paethPredictor(uint8_t a, uint8_t b, uint8_t c) {
         int p = static_cast<int>(a) + static_cast<int>(b) - static_cast<int>(c);
@@ -144,6 +149,17 @@ private:
                          : static_cast<int8_t>(val >> 1);
     }
 
+    static uint32_t crc32Update(uint32_t crc, const uint8_t* data, size_t len) {
+        for (size_t i = 0; i < len; ++i) {
+            crc ^= data[i];
+            for (int j = 0; j < 8; ++j) {
+                uint32_t mask = static_cast<uint32_t>(-static_cast<int32_t>(crc & 1u));
+                crc = (crc >> 1) ^ (CRC32_POLY & mask);
+            }
+        }
+        return crc;
+    }
+
 public:
     class Encoder {
     private:
@@ -153,6 +169,8 @@ public:
         uint8_t channels;
         std::vector<uint8_t> prevRow;
         uint32_t rowsWritten = 0;
+        uint32_t crcState = CRC32_INIT;
+        bool crcFooterWritten = false;
 
     public:
         Encoder(std::ostream& outputStream, uint16_t w, uint16_t h, uint8_t ch)
@@ -193,6 +211,16 @@ public:
 
         void flush() {
             bw.align();
+            if (!crcFooterWritten && rowsWritten >= height) {
+                uint32_t finalCrc = crcState ^ CRC32_XOROUT;
+                uint8_t footer[4];
+                footer[0] = static_cast<uint8_t>(finalCrc & 0xFF);
+                footer[1] = static_cast<uint8_t>((finalCrc >> 8) & 0xFF);
+                footer[2] = static_cast<uint8_t>((finalCrc >> 16) & 0xFF);
+                footer[3] = static_cast<uint8_t>((finalCrc >> 24) & 0xFF);
+                out.write(reinterpret_cast<char*>(footer), 4);
+                crcFooterWritten = true;
+            }
         }
 
         [[nodiscard]] bool encodeScanline(const uint8_t* currRow, size_t rowSize) {
@@ -200,6 +228,8 @@ public:
 
             if (currRow == nullptr || rowSize != stride) return false;
             if (rowsWritten >= height) return false;
+
+            crcState = crc32Update(crcState, currRow, stride);
 
             PredictorType bestPred = PRED_NONE;
             uint64_t minCost = 0xFFFFFFFFFFFFFFFFULL;
@@ -257,6 +287,11 @@ public:
 
             std::copy(currRow, currRow + stride, prevRow.begin());
             rowsWritten++;
+
+            if (rowsWritten >= height) {
+                flush();
+            }
+
             return out.good();
         }
     };
@@ -269,6 +304,9 @@ public:
         std::vector<uint8_t> prevRow;
         bool validHeader = false;
         uint32_t rowsRead = 0;
+        uint32_t crcState = CRC32_INIT;
+        bool crcChecked = false;
+        bool crcOk = false;
 
     public:
         explicit Decoder(std::istream& inputStream) : in(inputStream), br(inputStream) {
@@ -282,12 +320,12 @@ public:
                     header.width = static_cast<uint16_t>(headerData[0] | (headerData[1] << 8));
                     header.height = static_cast<uint16_t>(headerData[2] | (headerData[3] << 8));
                     header.channels = headerData[4];
-                    header.flags = headerData[5];
+                    header.formatVersion = headerData[5];
 
                     size_t stride = static_cast<size_t>(header.width) * static_cast<size_t>(header.channels);
 
                     if (header.width > 0 && header.height > 0 && header.channels > 0 &&
-                        header.flags == FORMAT_VERSION &&
+                        header.formatVersion == FORMAT_VERSION &&
                         stride <= MAX_DECODE_STRIDE) {
                         validHeader = true;
                         prevRow.resize(stride, 0);
@@ -301,6 +339,8 @@ public:
 
         [[nodiscard]] bool isValid() const { return validHeader; }
         const KNLFHeader& getHeader() const { return header; }
+        [[nodiscard]] bool isChecksumChecked() const { return crcChecked; }
+        [[nodiscard]] bool isChecksumValid() const { return crcOk; }
 
         [[nodiscard]] bool decodeScanline(uint8_t* outRow, size_t rowSize) {
             if (!validHeader) return false;
@@ -363,7 +403,25 @@ public:
             }
 
             std::copy(outRow, outRow + stride, prevRow.begin());
+            crcState = crc32Update(crcState, outRow, stride);
             rowsRead++;
+
+            if (rowsRead >= header.height) {
+                br.align();
+                uint8_t footer[4];
+                if (in.read(reinterpret_cast<char*>(footer), 4)) {
+                    uint32_t storedCrc = static_cast<uint32_t>(footer[0]) |
+                                         (static_cast<uint32_t>(footer[1]) << 8) |
+                                         (static_cast<uint32_t>(footer[2]) << 16) |
+                                         (static_cast<uint32_t>(footer[3]) << 24);
+                    uint32_t computedCrc = crcState ^ CRC32_XOROUT;
+                    crcOk = (storedCrc == computedCrc);
+                } else {
+                    crcOk = false;
+                }
+                crcChecked = true;
+            }
+
             return true;
         }
     };
