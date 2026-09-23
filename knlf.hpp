@@ -35,7 +35,9 @@ private:
     uint8_t bitPos = 0;
 
 public:
-    StreamBitWriter(std::ostream& os) : out(os) {}
+    explicit StreamBitWriter(std::ostream& os) : out(os) {}
+    StreamBitWriter(const StreamBitWriter&) = delete;
+    StreamBitWriter& operator=(const StreamBitWriter&) = delete;
 
     void writeBits(uint32_t val, uint8_t numBits) {
         for (int i = numBits - 1; i >= 0; --i) {
@@ -66,7 +68,9 @@ private:
     uint8_t bitPos = 8;
 
 public:
-    StreamBitReader(std::istream& is) : in(is) {}
+    explicit StreamBitReader(std::istream& is) : in(is) {}
+    StreamBitReader(const StreamBitReader&) = delete;
+    StreamBitReader& operator=(const StreamBitReader&) = delete;
 
     void align() {
         if (bitPos < 8) {
@@ -99,13 +103,15 @@ public:
 
 class KNLFStream {
 private:
-    static const size_t MAX_DECODE_STRIDE = 64 * 1024 * 1024;
+    static constexpr size_t MAX_DECODE_STRIDE = 64 * 1024 * 1024;
+    static constexpr uint8_t FORMAT_VERSION = 1;
+    static constexpr size_t HEADER_BODY_SIZE = 6;
 
     static uint8_t paethPredictor(uint8_t a, uint8_t b, uint8_t c) {
-        int p = (int)a + (int)b - (int)c;
-        int pa = std::abs(p - (int)a);
-        int pb = std::abs(p - (int)b);
-        int pc = std::abs(p - (int)c);
+        int p = static_cast<int>(a) + static_cast<int>(b) - static_cast<int>(c);
+        int pa = std::abs(p - static_cast<int>(a));
+        int pb = std::abs(p - static_cast<int>(b));
+        int pc = std::abs(p - static_cast<int>(c));
         if (pa <= pb && pa <= pc) return a;
         if (pb <= pc) return b;
         return c;
@@ -162,14 +168,14 @@ public:
             }
 
             out.write("KNLF", 4);
-            uint8_t headerData[6];
+            uint8_t headerData[HEADER_BODY_SIZE];
             headerData[0] = static_cast<uint8_t>(width & 0xFF);
             headerData[1] = static_cast<uint8_t>(width >> 8);
             headerData[2] = static_cast<uint8_t>(height & 0xFF);
             headerData[3] = static_cast<uint8_t>(height >> 8);
             headerData[4] = channels;
-            headerData[5] = 1;
-            out.write(reinterpret_cast<char*>(headerData), 6);
+            headerData[5] = FORMAT_VERSION;
+            out.write(reinterpret_cast<char*>(headerData), HEADER_BODY_SIZE);
 
             if (!out.good()) {
                 throw std::ios_base::failure("KNLFStream::Encoder: failed to write header");
@@ -177,6 +183,9 @@ public:
 
             prevRow.resize(stride, 0);
         }
+
+        Encoder(const Encoder&) = delete;
+        Encoder& operator=(const Encoder&) = delete;
 
         ~Encoder() {
             flush();
@@ -186,7 +195,7 @@ public:
             bw.align();
         }
 
-        bool encodeScanline(const uint8_t* currRow, size_t rowSize) {
+        [[nodiscard]] bool encodeScanline(const uint8_t* currRow, size_t rowSize) {
             size_t stride = static_cast<size_t>(width) * static_cast<size_t>(channels);
 
             if (currRow == nullptr || rowSize != stride) return false;
@@ -256,30 +265,29 @@ public:
     private:
         std::istream& in;
         StreamBitReader br;
-        KNLFHeader header;
+        KNLFHeader header{};
         std::vector<uint8_t> prevRow;
         bool validHeader = false;
         uint32_t rowsRead = 0;
 
     public:
-        Decoder(std::istream& inputStream) : in(inputStream), br(inputStream) {
+        explicit Decoder(std::istream& inputStream) : in(inputStream), br(inputStream) {
+            std::memset(&header, 0, sizeof(header));
+
             char magic[4];
-            if (in.read(magic, 4) && magic[0] == 'K' && magic[1] == 'N' && magic[2] == 'L' && magic[3] == 'F') {
-                uint8_t headerData[6];
-                if (in.read(reinterpret_cast<char*>(headerData), 6)) {
-                    header.magic[0] = 'K';
-                    header.magic[1] = 'N';
-                    header.magic[2] = 'L';
-                    header.magic[3] = 'F';
-                    header.width = headerData[0] | (headerData[1] << 8);
-                    header.height = headerData[2] | (headerData[3] << 8);
+            if (in.read(magic, 4) && std::memcmp(magic, "KNLF", 4) == 0) {
+                uint8_t headerData[HEADER_BODY_SIZE];
+                if (in.read(reinterpret_cast<char*>(headerData), HEADER_BODY_SIZE)) {
+                    std::memcpy(header.magic, "KNLF", 4);
+                    header.width = static_cast<uint16_t>(headerData[0] | (headerData[1] << 8));
+                    header.height = static_cast<uint16_t>(headerData[2] | (headerData[3] << 8));
                     header.channels = headerData[4];
                     header.flags = headerData[5];
 
                     size_t stride = static_cast<size_t>(header.width) * static_cast<size_t>(header.channels);
 
                     if (header.width > 0 && header.height > 0 && header.channels > 0 &&
-                        header.flags == 1 &&
+                        header.flags == FORMAT_VERSION &&
                         stride <= MAX_DECODE_STRIDE) {
                         validHeader = true;
                         prevRow.resize(stride, 0);
@@ -288,10 +296,13 @@ public:
             }
         }
 
-        bool isValid() const { return validHeader; }
+        Decoder(const Decoder&) = delete;
+        Decoder& operator=(const Decoder&) = delete;
+
+        [[nodiscard]] bool isValid() const { return validHeader; }
         const KNLFHeader& getHeader() const { return header; }
 
-        bool decodeScanline(uint8_t* outRow, size_t rowSize) {
+        [[nodiscard]] bool decodeScanline(uint8_t* outRow, size_t rowSize) {
             if (!validHeader) return false;
 
             size_t stride = static_cast<size_t>(header.width) * static_cast<size_t>(header.channels);
@@ -319,9 +330,7 @@ public:
                         uint8_t left = (idx >= header.channels) ? outRow[idx - header.channels] : 0;
                         uint8_t up = prevRow[idx];
                         uint8_t upLeft = (idx >= header.channels) ? prevRow[idx - header.channels] : 0;
-                        uint8_t pred = getPredictor(predType, left, up, upLeft);
-
-                        outRow[idx] = static_cast<uint8_t>(pred + 0);
+                        outRow[idx] = getPredictor(predType, left, up, upLeft);
                         idx++;
                     }
                 } else if (mode == 1) {
