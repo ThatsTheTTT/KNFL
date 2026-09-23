@@ -29,14 +29,24 @@ This repository contains the C/C++ reference encoder and decoder library.
 ## Building the Library
 
 ### Prerequisites
-* C++20 compliant compiler (GCC, Clang, MSVC)
-* CMake 3.16 or higher
+* C++17 compliant compiler (GCC, Clang, MSVC)
 
 ### Build Steps
 
+## Using the Library
+
+KNLF is a header-only library — no build step required.
+
+### Prerequisites
+- C++17 compliant compiler (GCC, Clang, MSVC)
+
+### Usage
+Copy `knlf.hpp` into your project and include it:
+
 ```bash
-git clone [https://github.com/your-username/KNLF.git](https://github.com/your-username/KNLF.git)
-cd KNLF
-mkdir build && cd build
-cmake ..
-cmake --build .
+git clone https://github.com/ThatsTheTTT/Kinda-Nice-Lossless-Format..git
+```
+
+```cpp
+#include "knlf.hpp"
+```
