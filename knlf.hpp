@@ -4,8 +4,11 @@
 #include <iostream>
 #include <vector>
 #include <cstdint>
+#include <cstring>
 #include <cmath>
+#include <cstdlib>
 #include <algorithm>
+#include <stdexcept>
 
 #pragma pack(push, 1)
 struct KNLFHeader {
@@ -96,6 +99,8 @@ public:
 
 class KNLFStream {
 private:
+    static const size_t MAX_DECODE_STRIDE = 64 * 1024 * 1024;
+
     static uint8_t paethPredictor(uint8_t a, uint8_t b, uint8_t c) {
         int p = (int)a + (int)b - (int)c;
         int pa = std::abs(p - (int)a);
@@ -110,10 +115,17 @@ private:
         switch (type) {
             case PRED_SUB:     return left;
             case PRED_UP:      return up;
-            case PRED_AVERAGE: return (static_cast<uint16_t>(left) + up) / 2;
+            case PRED_AVERAGE: return static_cast<uint8_t>((static_cast<uint16_t>(left) + up + 1) / 2);
             case PRED_PAETH:   return paethPredictor(left, up, upLeft);
             default:           return 0;
         }
+    }
+
+    static int8_t computeDiff(uint8_t curr, uint8_t pred) {
+        uint8_t u = static_cast<uint8_t>(curr - pred);
+        int8_t result;
+        std::memcpy(&result, &u, 1);
+        return result;
     }
 
     static uint8_t encodeZigZag(int8_t val) {
@@ -134,11 +146,21 @@ public:
         uint16_t width, height;
         uint8_t channels;
         std::vector<uint8_t> prevRow;
+        uint32_t rowsWritten = 0;
 
     public:
         Encoder(std::ostream& outputStream, uint16_t w, uint16_t h, uint8_t ch)
             : out(outputStream), bw(outputStream), width(w), height(h), channels(ch) {
-            
+
+            if (width == 0 || height == 0 || channels == 0) {
+                throw std::invalid_argument("KNLFStream::Encoder: width, height and channels must be non-zero");
+            }
+
+            size_t stride = static_cast<size_t>(width) * static_cast<size_t>(channels);
+            if (stride > MAX_DECODE_STRIDE) {
+                throw std::invalid_argument("KNLFStream::Encoder: stride exceeds maximum allowed size");
+            }
+
             out.write("KNLF", 4);
             uint8_t headerData[6];
             headerData[0] = static_cast<uint8_t>(width & 0xFF);
@@ -148,8 +170,12 @@ public:
             headerData[4] = channels;
             headerData[5] = 1;
             out.write(reinterpret_cast<char*>(headerData), 6);
-            
-            prevRow.resize(width * channels, 0);
+
+            if (!out.good()) {
+                throw std::ios_base::failure("KNLFStream::Encoder: failed to write header");
+            }
+
+            prevRow.resize(stride, 0);
         }
 
         ~Encoder() {
@@ -160,11 +186,16 @@ public:
             bw.align();
         }
 
-        bool encodeScanline(const uint8_t* currRow) {
-            size_t stride = width * channels;
-            
+        bool encodeScanline(const uint8_t* currRow, size_t rowSize) {
+            size_t stride = static_cast<size_t>(width) * static_cast<size_t>(channels);
+
+            if (currRow == nullptr || rowSize != stride) return false;
+            if (rowsWritten >= height) return false;
+
             PredictorType bestPred = PRED_NONE;
             uint64_t minCost = 0xFFFFFFFFFFFFFFFFULL;
+            std::vector<uint8_t> bestResidual(stride);
+            std::vector<uint8_t> testResidual(stride);
 
             for (int p = 0; p <= 4; ++p) {
                 PredictorType testPred = static_cast<PredictorType>(p);
@@ -174,26 +205,19 @@ public:
                     uint8_t up = prevRow[i];
                     uint8_t upLeft = (i >= channels) ? prevRow[i - channels] : 0;
                     uint8_t pred = getPredictor(testPred, left, up, upLeft);
-                    
-                    int8_t diff = static_cast<int8_t>(static_cast<uint8_t>(currRow[i] - pred));
+
+                    int8_t diff = computeDiff(currRow[i], pred);
                     cost += std::abs(static_cast<int>(diff));
+                    testResidual[i] = encodeZigZag(diff);
                 }
                 if (cost < minCost) {
                     minCost = cost;
                     bestPred = testPred;
+                    bestResidual.swap(testResidual);
                 }
             }
 
-            std::vector<uint8_t> residualLine(stride);
-            for (size_t i = 0; i < stride; ++i) {
-                uint8_t left = (i >= channels) ? currRow[i - channels] : 0;
-                uint8_t up = prevRow[i];
-                uint8_t upLeft = (i >= channels) ? prevRow[i - channels] : 0;
-                uint8_t pred = getPredictor(bestPred, left, up, upLeft);
-                
-                int8_t diff = static_cast<int8_t>(static_cast<uint8_t>(currRow[i] - pred));
-                residualLine[i] = encodeZigZag(diff);
-            }
+            const std::vector<uint8_t>& residualLine = bestResidual;
 
             bw.writeBits(static_cast<uint32_t>(bestPred), 3);
 
@@ -204,22 +228,26 @@ public:
                     while (idx + zeroRun < stride && residualLine[idx + zeroRun] == 0 && zeroRun < 64) {
                         zeroRun++;
                     }
-                    bw.writeBits(0, 2);
-                    bw.writeBits(static_cast<uint32_t>(zeroRun - 1), 6);
-                    idx += zeroRun;
-                } else {
-                    if (residualLine[idx] <= 15) {
-                        bw.writeBits(1, 2);
-                        bw.writeBits(residualLine[idx], 4);
-                    } else {
-                        bw.writeBits(2, 2);
-                        bw.writeBits(residualLine[idx], 8);
+                    if (zeroRun >= 2) {
+                        bw.writeBits(0, 2);
+                        bw.writeBits(static_cast<uint32_t>(zeroRun - 1), 6);
+                        idx += zeroRun;
+                        continue;
                     }
-                    idx++;
                 }
+
+                if (residualLine[idx] <= 15) {
+                    bw.writeBits(1, 2);
+                    bw.writeBits(residualLine[idx], 4);
+                } else {
+                    bw.writeBits(2, 2);
+                    bw.writeBits(residualLine[idx], 8);
+                }
+                idx++;
             }
 
             std::copy(currRow, currRow + stride, prevRow.begin());
+            rowsWritten++;
             return out.good();
         }
     };
@@ -231,6 +259,7 @@ public:
         KNLFHeader header;
         std::vector<uint8_t> prevRow;
         bool validHeader = false;
+        uint32_t rowsRead = 0;
 
     public:
         Decoder(std::istream& inputStream) : in(inputStream), br(inputStream) {
@@ -238,16 +267,23 @@ public:
             if (in.read(magic, 4) && magic[0] == 'K' && magic[1] == 'N' && magic[2] == 'L' && magic[3] == 'F') {
                 uint8_t headerData[6];
                 if (in.read(reinterpret_cast<char*>(headerData), 6)) {
-                    header.magic[0] = 'K'; 
-                    header.magic[1] = 'N'; 
-                    header.magic[2] = 'L'; 
+                    header.magic[0] = 'K';
+                    header.magic[1] = 'N';
+                    header.magic[2] = 'L';
                     header.magic[3] = 'F';
                     header.width = headerData[0] | (headerData[1] << 8);
                     header.height = headerData[2] | (headerData[3] << 8);
                     header.channels = headerData[4];
                     header.flags = headerData[5];
-                    validHeader = true;
-                    prevRow.resize(header.width * header.channels, 0);
+
+                    size_t stride = static_cast<size_t>(header.width) * static_cast<size_t>(header.channels);
+
+                    if (header.width > 0 && header.height > 0 && header.channels > 0 &&
+                        header.flags == 1 &&
+                        stride <= MAX_DECODE_STRIDE) {
+                        validHeader = true;
+                        prevRow.resize(stride, 0);
+                    }
                 }
             }
         }
@@ -255,13 +291,17 @@ public:
         bool isValid() const { return validHeader; }
         const KNLFHeader& getHeader() const { return header; }
 
-        bool decodeScanline(uint8_t* outRow) {
+        bool decodeScanline(uint8_t* outRow, size_t rowSize) {
             if (!validHeader) return false;
 
-            size_t stride = header.width * header.channels;
+            size_t stride = static_cast<size_t>(header.width) * static_cast<size_t>(header.channels);
+
+            if (outRow == nullptr || rowSize != stride) return false;
+            if (rowsRead >= header.height) return false;
 
             uint32_t predBits = 0;
             if (!br.readBits(predBits, 3)) return false;
+            if (predBits > static_cast<uint32_t>(PRED_PAETH)) return false;
             PredictorType predType = static_cast<PredictorType>(predBits);
 
             size_t idx = 0;
@@ -280,7 +320,8 @@ public:
                         uint8_t up = prevRow[idx];
                         uint8_t upLeft = (idx >= header.channels) ? prevRow[idx - header.channels] : 0;
                         uint8_t pred = getPredictor(predType, left, up, upLeft);
-                        outRow[idx] = pred;
+
+                        outRow[idx] = static_cast<uint8_t>(pred + 0);
                         idx++;
                     }
                 } else if (mode == 1) {
@@ -292,6 +333,7 @@ public:
                     uint8_t up = prevRow[idx];
                     uint8_t upLeft = (idx >= header.channels) ? prevRow[idx - header.channels] : 0;
                     uint8_t pred = getPredictor(predType, left, up, upLeft);
+
                     outRow[idx] = static_cast<uint8_t>(pred + diff);
                     idx++;
                 } else if (mode == 2) {
@@ -303,6 +345,7 @@ public:
                     uint8_t up = prevRow[idx];
                     uint8_t upLeft = (idx >= header.channels) ? prevRow[idx - header.channels] : 0;
                     uint8_t pred = getPredictor(predType, left, up, upLeft);
+
                     outRow[idx] = static_cast<uint8_t>(pred + diff);
                     idx++;
                 } else {
@@ -311,6 +354,7 @@ public:
             }
 
             std::copy(outRow, outRow + stride, prevRow.begin());
+            rowsRead++;
             return true;
         }
     };
