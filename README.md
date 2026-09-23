@@ -4,7 +4,7 @@
 
 KNLF is a memory-efficient lossless image compression format optimized for a low RAM footprint and line-by-line decoding. It is designed for embedded systems, microcontrollers, and low-resource environments.
 
-This repository contains the C/C++ reference encoder and decoder library.
+This repository contains the C++ reference encoder and decoder library.
 
 ---
 
